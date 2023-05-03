@@ -1,0 +1,3 @@
+[submodule "server"]
+	path = server
+	url = https://github.com/aljanabim/simple_webrtc_signaling_server

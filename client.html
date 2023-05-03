@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js" integrity="sha384-c79GN5VsunZvi+Q/WObgk2in0CbZsHnjEqvFxC5DxHn9lTfNce2WW6h2pH6u/kF+" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div id="participants" style="display: block;"></div>
+    <button id="muteAudio">Mute Audio</button>
+    <button id="muteVideo">Mute Video</button>
+    <div id="log"></div>
+</body>
+<script>
+    class SignalingChannel {
+        constructor(peerId, signalingServerUrl, token) {
+            this.peerId = peerId;
+            this.socket = new io(signalingServerUrl, {
+                auth: { token },
+                autoConnect: false, // disables auto connection, by default the client would connect to the server as soon as the io() object is instatiated
+                reconnection: false, // disables auto reconnection, this can occur when for example the host server disconnects. When set to true, the client would keep trying to reconnect
+                // for a complete list of the available options, see https://socket.io/docs/v4/client-api/#new-Manager-url-options
+            });
+            this.onMessage = () => {};
+        }
+        connect() {
+            this.socket.on("connect", () => {
+                console.log("Connected with id", this.socket.id);
+                this.socket.emit("ready", this.peerId);
+            });
+            this.socket.on("disconnect", () => {
+                console.log("Disconnected");
+            });
+            this.socket.on("connect_error", (error) => {
+                console.log("Connection error", error.message);
+            });
+            this.socket.on("message", this.onMessage);
+            this.socket.on("uniquenessError", (message) => {
+                console.error(`Error: ${message.error}`);
+                // process.exit(1);
+            });
+            this.socket.connect();
+        }
+        send(message) {
+            this.socket.emit("message", { from: this.peerId, target: "all", message });
+        }
+        sendTo(targetPeerId, message) {
+            this.socket.emit("messageOne", { from: this.peerId, target: targetPeerId, message });
+        }
+        disconnect() {
+            if (this.socket) {
+                this.socket.disconnect();
+            }
+        }
+    }
+
+    /**
+     * @param {String} HTML representing a single element
+     * @return {Element}
+     */
+    function htmlToElement(html) {
+        var template = document.createElement('template');
+        html = html.trim(); // Never return a text node of whitespace as the result
+        template.innerHTML = html;
+        return template.content.firstChild;
+    }
+</script>
+<script>
+    const logEl = document.querySelector("#log")
+    const oldLog = console.log
+    console.log = (...msg) => {
+        logEl.innerHTML += msg.join(" ") + "<br/>"
+        oldLog(...msg)
+    }
+    const peerId = (Math.random() + 1).toString(36).substring(7);
+    const port = 3030;
+    const signalingServerUrl = "http://localhost:" + port;
+    const token = "DINGUS123";
+    const participantEl = document.querySelector("#participants")
+    const audioMuteEl = document.querySelector("#muteAudio")
+    const videoMuteEl = document.querySelector("#muteVideo")
+    
+    let audioStream, videoStream, myEl, myVideoEl, myAudioCtx
+    audioMuteEl.addEventListener("click", () => {
+        let track
+        if (!audioStream || !(track = audioStream.getAudioTracks()[0])) return
+        track.enabled = !track.enabled
+    })
+    videoMuteEl.addEventListener("click", () => {
+        let track
+        if (!videoStream || !(track = videoStream.getVideoTracks()[0])) return
+        track.enabled = !track.enabled
+    })
+
+    ;(async () => {
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
+            
+            videoStream = new MediaStream([stream.getVideoTracks()[0]])
+            myEl = htmlToElement(`<div id="peer-me"></div>`)
+            myVideoEl = htmlToElement(`<video id="media-${videoStream.id}" data-peer="${peerId}" width="160" height="120" autoplay playsinline mute/>`)
+            myVideoEl.srcObject = videoStream
+            participantEl.appendChild(myEl)
+            myEl.appendChild(myVideoEl)
+
+            audioStream = new MediaStream([stream.getAudioTracks()[0]])
+            myAudioCtx = new AudioContext();
+            const source = myAudioCtx.createMediaStreamSource(audioStream); 
+            const gainNode = myAudioCtx.createGain();
+            source.connect(gainNode)
+            gainNode.connect(myAudioCtx.destination)
+
+            channel.connect();
+            channel.socket.on("connect", () => channel.send({id: channel.socket.id}))
+        } catch (e) {
+            console.log(e);
+        }
+    })();
+
+    channel = new SignalingChannel(peerId, signalingServerUrl, token);
+    peers = {}
+    let makingOffer = false
+    async function sendOffer(peerId) {
+        let pc = peers[peerId] ??= createPeer(peerId)
+        try {
+            makingOffer = true
+            let offer = await pc.createOffer()
+            if (pc.signalingState != "stable") {
+                console.log("cancel send offer")
+                return
+            };
+            console.log("send offer")
+            await pc.setLocalDescription(offer)
+            channel.sendTo(peerId, {description: pc.localDescription})
+        } catch (error) {
+            console.log(error)
+        } finally {
+            makingOffer = false
+        }
+    }
+    channel.onMessage = async ({from, target, message}) => {
+        let {description, ice, id} = message || {}
+        try {
+            if (!message) return
+
+            if (id) {
+                await sendOffer(from)
+                return
+            }
+
+            let pc = peers[from] ??= createPeer(from)
+
+            if (description) {
+                const offerCollision = description.type == "offer" &&
+                                 (makingOffer || pc.signalingState != "stable");
+                let ignoreOffer = !pc.polite && offerCollision;
+                if (ignoreOffer) {
+                    console.log("ignore offer")
+                    return
+                }
+
+                if (offerCollision) {
+                    console.log("offer collision")
+                    await Promise.all([
+                        pc.setLocalDescription({type: "rollback"}),
+                        pc.setRemoteDescription(description)
+                    ]);
+                } else {
+                    console.log(`accept ${description.type}`)
+                    await pc.setRemoteDescription(description);
+                }
+
+                if (description.type == "offer") {
+                    console.log("accept offer")
+                    await pc.setLocalDescription(await pc.createAnswer());
+                    channel.sendTo(from, {description: pc.localDescription});
+                }
+                return
+            }
+
+            if (ice) {
+                try {
+                    console.log("ice", ice)
+                    await pc.addIceCandidate(ice);
+                } catch (e) {
+                    console.log(e)
+                }
+            }
+        } catch (error) {
+            console.log(error)
+        }
+    };
+
+    
+    function createPeer(from) {
+        let pc = new RTCPeerConnection();
+        pc.id = from
+        let peerEl = pc.peerEl ??= htmlToElement(`<div id="peer-${from}"><div/>`)
+        participantEl.appendChild(peerEl)
+        pc.polite = [peerId, from].sort()[0] === peerId
+        pc.streams = {}
+        pc.onnegotiationneeded = async () => {
+            try {
+                makingOffer = true;
+                const offer = await pc.createOffer();
+                if (pc.signalingState != "stable") return;
+                await pc.setLocalDescription(offer);
+                channel.sendTo(from, {description: pc.localDescription});
+            } catch (e) {
+                console.log(`ONN ${e}`);
+            } finally {
+                makingOffer = false;
+            }
+        }
+        pc.onicecandidate = (ev) => {
+            if (!ev.candidate) return
+            channel.sendTo(from, {ice: ev.candidate})
+        }
+        pc.oniceconnectionstatechange = () => {
+            if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected")
+                deletePeer(pc)
+            console.log(`${from} ice: ${pc.iceConnectionState}`)
+        };
+        pc.onsignalingstatechange = () => console.log(`${from} signal: ${pc.iceConnectionState}`);
+        pc.ontrack = ({track, streams: [stream]}) => {
+            if (pc.streams[stream.id]) return
+            console.log("recv:", stream.id)
+            if (track.kind === "video") {
+                let streamData = pc.streams[stream.id] = {}
+                streamData.id ??= stream.id
+                streamData.stream ??= stream
+                streamData.elem ??= htmlToElement(`<video id="media-${stream.id}" data-peer="${from}" width="160" height="120" autoplay playsinline mute/>`)
+                pc.peerEl.appendChild(streamData.elem)
+                streamData.elem.srcObject = stream
+            } else {
+                console.log(stream.getTracks())
+                const audioCtx = new AudioContext();
+                const source = audioCtx.createMediaStreamSource(stream); 
+                const gainNode = audioCtx.createGain();
+                source.connect(gainNode)
+                gainNode.connect(audioCtx.destination)
+                let streamData = pc.streams[stream.id] = {}
+                streamData.id ??= stream.id
+                streamData.stream ??= stream
+                streamData.audioCtx ??= audioCtx
+            }
+            stream.onremovetrack ??= ({track}) => {
+                console.log(`${track.kind} track was removed.`);
+                if (!stream.getTracks().length) {
+                    console.log(`stream ${stream.id} emptied (effectively removed).`);
+                }
+            };
+        };
+        pc.ondatachannel = (ev) => {
+            console.log("dc", ev)
+            if (ev.channel.label === "ch") {
+                ev.channel.onmessage = (msg) => onChMessage(pc, msg)
+                ev.channel.onclose = () => deletePeer(pc)
+                ev.channel.onerror = ev.channel.onclose
+            }
+        }
+        setTimeout(() => {
+            console.log(`send`, audioStream.id)
+            pc.addTrack(audioStream.getAudioTracks()[0], audioStream);
+            console.log(`send`, videoStream.id)
+            pc.addTrack(videoStream.getVideoTracks()[0], videoStream);
+            let ch = pc.channel = pc.createDataChannel("ch")
+            ch.onmessage = (msg) => onChMessage(pc, msg)
+            ch.onclose = () => deletePeer(pc)
+            ch.onerror = () => deletePeer(pc)
+            ch.onopen = () => {
+                ch.send(JSON.stringify({type: "hi"}))
+                ch.send(JSON.stringify({
+                    type: "stream",
+                    streamId: audioStream.id,
+                    streamType: "cam"
+                }))
+                ch.send(JSON.stringify({
+                    type: "stream",
+                    streamId: videoStream.id,
+                    streamType: "cam"
+                }))
+            }
+        }, 5000)
+        peers[from] = pc
+        return pc
+    }
+
+    function stopTracks(stream) {
+        stream.getTracks().forEach(t => t.stop())
+    }
+
+    function deletePeer(pc) {
+        pc.channel.close()
+        Object.entries(pc.streams).forEach(([streamId, streamObj]) => {
+            if (!streamObj.stream) return
+            let stream
+            if ((stream = streamObj.stream).kind === "video")
+                stopTracks(stream)
+            else if(streamObj.audioCtx)
+                streamObj.audioCtx.close()
+            if (streamObj.elem)
+                streamObj.elem.remove()
+        })
+        delete peers[pc.id]
+    }
+
+    /** 
+     * {
+     *   type: hi | bye | muteAudio | muteVideo | stream
+     *   mute?: boolean
+     *   streamId?: string
+     *   streamType?: cam | screen
+     * }
+     */
+    function onChMessage(pc, {data}) {
+        let {type, mute, streamId, streamType} = JSON.parse(data || "{}") || {}
+        switch (type) {
+            case "stream":
+                let streamData = pc.streams[streamId] ??= {}
+                streamData.id ??= streamId
+                streamData.type = streamType
+                console.log(streamData)
+                break;
+            default:
+                break;
+        }
+    }
+    
+</script>
+</html>
