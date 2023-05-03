@@ -14,6 +14,7 @@
     <div id="log"></div>
 </body>
 <script>
+    // Taken from https://github.com/aljanabim/simple_webrtc_signaling_server/tree/main/examples
     class SignalingChannel {
         constructor(peerId, signalingServerUrl, token) {
             this.peerId = peerId;
@@ -68,6 +69,9 @@
     }
 </script>
 <script>
+    // Inspired from https://blog.mozilla.org/webrtc/perfect-negotiation-in-webrtc/ 
+    // and https://jsfiddle.net/jib1/43enz7xu/
+    
     const logEl = document.querySelector("#log")
     const oldLog = console.log
     console.log = (...msg) => {
